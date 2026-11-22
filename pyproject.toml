@@ -32,6 +32,10 @@ dev = ["gemini-fastapi[dev]"]
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+# `app` is the only first-party package. Left alone, ruff also takes any directory at the
+# repository root that is named after a dependency (the cookie cache the client writes when the
+# server runs from here) as first-party, and every import block is then out of order.
+src = []
 
 [tool.ruff.lint]
 select = [
@@ -55,6 +59,16 @@ select = [
 ignore = [
   "E501", # line too long, enforced by the formatter for code
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# The action-list tool protocol talks to the model in Chinese, where full-width punctuation is
+# correct rather than ambiguous.
+"app/utils/helper.py" = ["RUF001", "RUF002"]
+"app/utils/config.py" = ["RUF001"]
+"tests/test_prose_protocol.py" = ["RUF001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = [

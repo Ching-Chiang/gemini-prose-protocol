@@ -13,3 +13,12 @@ __pycache__
 config.debug.yaml
 data/
 tmp/
+pytest-of-*/
+*.log
+prose-bench.json
+
+# Cookie jars are credentials: keep them out of the repository
+*cookies*.json
+
+# Cookie cache the Gemini client writes into the working directory
+gemini_webapi/

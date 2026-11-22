@@ -1,4 +1,4 @@
-# Gemini-FastAPI
+# Gemini 散文协议 / Gemini Prose Protocol
 
 [![Python 3.13](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-green.svg)](https://fastapi.tiangolo.com/)
@@ -10,6 +10,8 @@ Web-based Gemini models wrapped into an OpenAI-compatible API. Powered by [Hanao
 
 **Call Gemini's web-based models via API without an API Key, completely free!**
 
+This is a fork of [Nativu5/Gemini-FastAPI](https://github.com/Nativu5/Gemini-FastAPI) (MIT, © 2025 Yongkun Li) that adds the prose tool protocol described below. The first commit of this repository is the upstream tree verbatim, so the differences are exactly `git log -p`.
+
 ## Features
 
 - **No Google API key**: authenticates with the cookies of a signed-in Gemini web session.
@@ -19,6 +21,33 @@ Web-based Gemini models wrapped into an OpenAI-compatible API. Powered by [Hanao
 - **Google Search included**: answers can draw on Gemini's built-in web search.
 - **Conversation reuse**: a follow-up request continues the same Google chat instead of resending the history.
 - **Multiple accounts**: requests are spread across accounts, each with its own proxy.
+
+## The prose tool protocol
+
+The web app rejects tool definitions that look like a schema, and drops large ones. With
+`tool_protocol: "prose"` the tools are described to the model as a plain action list instead, and the
+action block is parsed back out of the reply and returned as an ordinary OpenAI `tool_calls` entry:
+
+```
+action: read_file
+path = app/models.py
+```
+
+It is a trade: an action list is accepted far more often than a schema, at the cost of an occasional
+miss. `tool_choice: "auto"` is never retried; a forced or named `tool_choice` is re-asked
+`tool_retry_attempts` times.
+
+```yaml
+gemini:
+  tool_protocol: "prose"          # "pascal" keeps the original [ToolCalls] tag protocol
+  tool_protocol_language: "zh"    # wording of the instructions: "zh" or "en"
+  tool_retry_attempts: 1          # re-asks a forced tool_choice that came back without a call
+  tool_argument_max_chars: 20000  # largest argument block one action may carry
+```
+
+A reply is untrusted text, so only actions that were offered are accepted, at most one action is
+taken per reply, action blocks inside fenced code are ignored, and an argument block above the limit
+is dropped. `scripts/measure_prose_hit_rate.py` measures the hit rate against your own account.
 
 ## Quick Start
 

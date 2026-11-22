@@ -1,9 +1,9 @@
 # Gemini FastAPI Configuration File
 
 server:
-  host: "0.0.0.0" # Server bind address
+  host: "127.0.0.1" # Server bind address (local only; do not expose on LAN)
   port: 8000 # Server port
-  api_key: null # API key for authentication (null for no auth)
+  api_key: null # Set your own key, or null to disable auth # API key for authentication (null for no auth)
   # Local transport safety ceiling only; Gemini Web remains authoritative for its actual input limit.
   max_request_body_bytes: 268435456 # 256 MiB; set to 0 to disable the wrapper-side safeguard
   # Regex budget for validating one response against a client-supplied JSON Schema.
@@ -23,10 +23,11 @@ cors:
 
 gemini:
   clients:
-    - id: "client-id-1" # Arbitrary client ID
-      secure_1psid: "YOUR_SECURE_1PSID_HERE" # Gemini Secure 1PSID
-      secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE" # Gemini Secure 1PSIDTS
-      proxy: null # Optional proxy URL (null/empty means direct connection)
+    - id: "acct-1" # Arbitrary client ID (keep stable, it tags stored conversations)
+      secure_1psid: "" # Your Gemini __Secure-1PSID cookie # Gemini Secure 1PSID
+      secure_1psidts: "" # Your Gemini __Secure-1PSIDTS cookie # Gemini Secure 1PSIDTS
+      proxy: null # Optional proxy URL # Optional proxy URL (null/empty means direct connection)
+      cookies_file: null # Optional JSON jar with the remaining google.com cookies # Extra google.com cookies (OSID etc.); see grab_cookies_cdp.py
       impersonate: null # Optional browser impersonation target (null uses library default)
   timeout: 450 # Request timeout in seconds (Not less than 30s)
   watchdog_timeout: 120 # Watchdog timeout in seconds (Not less than 30s)
@@ -34,9 +35,20 @@ gemini:
   refresh_interval: 600 # Refresh interval in seconds (Not less than 60s)
   auto_close: false # Automatically close Gemini session after inactivity
   close_delay: 900 # Inactivity delay in seconds before auto-closing (Not less than 30s)
-  verbose: true # Enable verbose logging for Gemini requests
+  verbose: false # Enable verbose logging for Gemini requests (flip to true when troubleshooting)
   extended_thinking: false # Enable Gemini extended thinking mode for message generation
-  max_chars_per_request: 1000000 # Maximum characters Gemini Web accepts per request. Non-pro users might have a lower limit
+  # How the tool interface is described to the model and parsed back:
+  #   "pascal" - the original [ToolCalls] tag protocol with JSON Schema parameters.
+  #   "prose"  - the tools as a plain-language action list, expecting a "lead line + name=value"
+  #              block in the reply. The web app refuses schema-shaped tool definitions and drops
+  #              large ones upstream; an action list is accepted far more often, at the cost of
+  #              occasional misses. Keep this file ASCII-only: the YAML source uses the locale
+  #              code page, which cannot decode CJK text on Windows.
+  tool_protocol: "prose"
+  tool_protocol_language: "zh" # Wording of the "prose" instructions: "zh" (default) or "en"
+  tool_retry_attempts: 1 # Under "prose", how many times a forced tool_choice is re-asked on a miss
+  tool_argument_max_chars: 20000 # Under "prose", the largest argument block one action may carry
+  max_chars_per_request: 60000 # Lowered from default: Chinese text hits the upstream byte wall (~130KB) around 43K chars; >90% is sent as a message.txt attachment
   allow_private_url_fetch: false # Allow server-side fetching of private/loopback URLs (SSRF risk; default blocks them)
   url_fetch_timeout: 15 # Timeout in seconds for server-side URL fetches
   # What happens to the chats this server opens in the Google account:
@@ -45,8 +57,8 @@ gemini:
   #                   reply can come back without the earlier context. The input limit is also lower.
   #   "auto_delete" - kept like "normal", then deleted from Google and from local storage once idle
   #                   for auto_delete_ttl. Only chats opened in this mode are ever deleted.
-  chat_mode: "normal"
-  auto_delete_ttl: 86400 # Idle seconds before an "auto_delete" chat is deleted (Not less than 60s)
+  chat_mode: "auto_delete"
+  auto_delete_ttl: 3600 # Idle seconds before an "auto_delete" chat is deleted (Not less than 60s)
   # Guest client health policy: "strict" fails if any client is unhealthy; "adaptive" fails only if all are unhealthy; "permissive" only logs a warning.
   guest_mode: "adaptive"
   # Send the system prompt at the start of a /v1/chat/completions or /v1/responses request as a
@@ -80,4 +92,4 @@ storage:
   retention_days: 14
 
 logging:
-  level: "DEBUG" # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO" # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL

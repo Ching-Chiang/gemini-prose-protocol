@@ -168,6 +168,10 @@ def test_names_this_server_never_generates_are_refused(tmp_path, filename):
     assert _resolve_media_file(store, filename) is None
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="creating a symbolic link on Windows needs SeCreateSymbolicLinkPrivilege",
+)
 def test_a_link_that_leads_out_of_the_store_is_not_followed(tmp_path):
     store = tmp_path / "store"
     store.mkdir()
