@@ -4,7 +4,7 @@ import hashlib
 import io
 import reprlib
 import uuid
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -90,8 +90,11 @@ from app.utils.helper import (
     normalize_app_message_role,
     normalize_llm_text,
     process_llm_output,
+    prose_retry_nudge,
     strip_system_hints,
     text_from_message,
+    tool_protocol,
+    tool_retry_attempts,
     validate_json_schema,
 )
 
@@ -1020,6 +1023,62 @@ async def _send_and_await_first_chunk(
     return _restream(first, generator)
 
 
+def _offered_function_names(tools: Sequence[Any] | None) -> set[str] | None:
+    """The function names a request offers, in either API's tool layout; None if it offers none.
+
+    Prose replies are ordinary text, so a reply that quotes a page or a file can contain an action
+    block nobody asked for. Passing this set to `process_llm_output` keeps only the actions the
+    request actually offered.
+    """
+    names: set[str] = set()
+    for tool in tools or []:
+        function = getattr(tool, "function", None) or tool
+        name = getattr(function, "name", None)
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names or None
+
+
+def _forces_a_tool(tool_choice: Any) -> bool:
+    """True when the request leaves the model no choice but to call a tool."""
+    return tool_choice == "required" or extract_named_tool_choice(tool_choice) is not None
+
+
+async def _retry_prose_tool_call(
+    session: ChatSession,
+    structured_requirement: StructuredOutputRequirement | None,
+    allowed_tool_names: Collection[str] | None = None,
+) -> tuple[list[AppToolCall], str]:
+    """Re-ask for an action block when a forced tool choice came back as plain text."""
+    attempts = tool_retry_attempts()
+    for attempt in range(1, attempts + 1):
+        logger.info(
+            f"No action block under a forced tool_choice; re-asking ({attempt}/{attempts})."
+        )
+        try:
+            output = await _send_and_await_first_chunk(
+                session, prose_retry_nudge(), files=[], stream=False
+            )
+        except Exception as exc:
+            logger.warning(f"Re-asking for an action block failed: {exc}")
+            return [], ""
+
+        text = output.text if isinstance(output, ModelOutput) else ""
+        try:
+            _, visible, calls = process_llm_output(
+                "",
+                normalize_llm_text(text or ""),
+                structured_requirement,
+                allowed_tool_names,
+            )
+        except StructuredOutputValidationError:
+            return [], ""
+        if calls:
+            return calls, visible
+
+    return [], ""
+
+
 async def _send_with_internal_fallback(
     *,
     pool: GeminiClientPool,
@@ -1461,8 +1520,15 @@ def _create_real_streaming_response(
     base_url: str,
     structured_requirement: StructuredOutputRequirement | None = None,
     tool_choice: Any = None,
+    prose_mode: bool = False,
+    allowed_tool_names: Collection[str] | None = None,
 ) -> StreamingResponse:
-    """The SSE stream of a Chat Completions reply; the conversation is stored once it completes."""
+    """The SSE stream of a Chat Completions reply; the conversation is stored once it completes.
+
+    `prose_mode` holds the text back until the reply is parsed: under the action-list protocol the
+    call block is ordinary prose, so streaming it live would show the client the raw block as well
+    as the parsed call.
+    """
 
     async def generate_stream():
         streamed = _Streamed()
@@ -1483,7 +1549,7 @@ def _create_real_streaming_response(
             yield make_chunk({"role": "assistant", "content": ""})
             try:
                 async for is_thought, delta in _visible_deltas(
-                    generator, streamed, downloads, not structured_requirement
+                    generator, streamed, downloads, not structured_requirement and not prose_mode
                 ):
                     yield make_chunk({"reasoning_content" if is_thought else "content": delta})
             except Exception as e:
@@ -1496,18 +1562,26 @@ def _create_real_streaming_response(
                     normalize_llm_text(streamed.thoughts),
                     normalize_llm_text(streamed.text),
                     structured_requirement,
+                    allowed_tool_names,
                 )
             except StructuredOutputValidationError as exc:
                 yield _sse_error(
                     str(exc), "invalid_model_output", "response_format", "schema_validation_failed"
                 )
                 return
+            if prose_mode and not detected_tool_calls and _forces_a_tool(tool_choice):
+                retried_calls, retried_visible = await _retry_prose_tool_call(
+                    session, structured_requirement, allowed_tool_names
+                )
+                if retried_calls:
+                    detected_tool_calls = retried_calls
+                    visible_output = retried_visible or visible_output
             if choice_error := _tool_choice_failure(tool_choice, detected_tool_calls):
                 yield _sse_error(
                     choice_error, "invalid_model_output", "tool_choice", "required_tool_missing"
                 )
                 return
-            if structured_requirement and visible_output:
+            if (structured_requirement or prose_mode) and visible_output:
                 yield make_chunk({"content": visible_output})
 
             storage_output = visible_output  # plus the links to generated files, sent next
@@ -1572,6 +1646,7 @@ def _create_responses_real_streaming_response(
     has_image_tool: bool = False,
 ) -> StreamingResponse:
     """The event stream of a Responses reply; the conversation is stored once it completes."""
+    offered = _offered_function_names(request.tools)
     base_event = {
         "id": response_id,
         "object": "response",
@@ -1798,6 +1873,7 @@ def _create_responses_real_streaming_response(
                     normalize_llm_text(streamed.thoughts),
                     normalize_llm_text(streamed.text),
                     structured_requirement,
+                    offered,
                 )
             except StructuredOutputValidationError as exc:
                 yield make_event(
@@ -1998,6 +2074,9 @@ async def create_chat_completion(
     )
 
     if not isinstance(resp_or_stream, ModelOutput):  # which is what `stream` asked for
+        prose_mode = (
+            tool_protocol() == "prose" and bool(request.tools) and request.tool_choice != "none"
+        )
         return _create_real_streaming_response(
             resp_or_stream,
             completion_id,
@@ -2011,6 +2090,8 @@ async def create_chat_completion(
             base_url,
             structured_requirement,
             request.tool_choice,
+            prose_mode,
+            function_names or None,
         )
 
     try:
@@ -2018,9 +2099,23 @@ async def create_chat_completion(
             normalize_llm_text(resp_or_stream.thoughts or ""),
             normalize_llm_text(resp_or_stream.text or ""),
             structured_requirement,
+            function_names or None,
         )
     except StructuredOutputValidationError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    if (
+        tool_protocol() == "prose"
+        and request.tools
+        and not tool_calls
+        and _forces_a_tool(request.tool_choice)
+    ):
+        retried_calls, retried_visible = await _retry_prose_tool_call(
+            session, structured_requirement, function_names or None
+        )
+        if retried_calls:
+            tool_calls = retried_calls
+            visible_output = retried_visible or visible_output
 
     if choice_error := _tool_choice_failure(request.tool_choice, tool_calls):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=choice_error)
@@ -2180,6 +2275,7 @@ async def create_response(
             normalize_llm_text(resp_or_stream.thoughts or ""),
             normalize_llm_text(resp_or_stream.text or ""),
             structured_requirement,
+            _offered_function_names(standard_tools),
         )
     except StructuredOutputValidationError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc

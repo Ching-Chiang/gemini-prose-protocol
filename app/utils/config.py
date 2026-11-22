@@ -55,6 +55,15 @@ class GeminiClientSettings(BaseModel):
     secure_1psid: str | None = Field(default=None, description="Gemini Secure 1PSID")
     secure_1psidts: str | None = Field(default=None, description="Gemini Secure 1PSIDTS")
     proxy: str | None = Field(default=None, description="Proxy URL for this Gemini client")
+    cookies_file: str | None = Field(
+        default=None,
+        description=(
+            "Path to a JSON object of extra google.com cookies to send with every request. "
+            "Google now redirects a session that carries only __Secure-1PSID/__Secure-1PSIDTS "
+            "back to accounts.google.com (it wants OSID); dumping the browser jar keeps the "
+            "client authenticated and lets the library rotate 1PSIDTS."
+        ),
+    )
     impersonate: BrowserTypeLiteral | None = Field(
         default=None,
         description="Browser impersonation target for curl_cffi. None uses library default",
@@ -194,6 +203,40 @@ class GeminiConfig(BaseModel):
         default=1_000_000,
         ge=1,
         description="Maximum characters Gemini Web can accept per request",
+    )
+    tool_protocol: Literal["pascal", "prose"] = Field(
+        default="pascal",
+        description=(
+            "How the tool interface is described to the model and parsed back. "
+            "'pascal' is the original [ToolCalls] tag protocol with JSON Schema parameters. "
+            "'prose' describes the tools as a plain-language action list and expects an "
+            "'action: name' block, which the web app accepts far more often, at the cost of "
+            "occasionally answering without a call"
+        ),
+    )
+    tool_protocol_language: Literal["en", "zh"] = Field(
+        default="zh",
+        description=(
+            "Wording of the instructions under tool_protocol='prose': 'zh' (default) or 'en'. "
+            "The pascal protocol ignores it"
+        ),
+    )
+    tool_retry_attempts: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        description=(
+            "Under tool_protocol='prose', how many times a forced tool_choice is re-asked when the "
+            "model answers without a call. 'auto' is never retried: a plain answer may be intended"
+        ),
+    )
+    tool_argument_max_chars: int = Field(
+        default=20000,
+        ge=256,
+        description=(
+            "Under tool_protocol='prose', the largest serialized argument list one action may "
+            "carry; a larger block is dropped instead of being returned to the client"
+        ),
     )
     chat_mode: ChatMode = Field(
         default=ChatMode.NORMAL,

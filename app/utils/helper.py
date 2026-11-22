@@ -11,7 +11,7 @@ import struct
 import tempfile
 import time
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
@@ -103,6 +103,100 @@ TOOL_CHOICE_REQUIRED_PROMPT = (
 TOOL_CHOICE_NAMED_PROMPT = (
     "TOOL CHOICE = `{target_name}`: You MUST call `{target_name}` this turn and no other tool."
 )
+# The prose protocol: the same capability, described as a plain action list instead of a schema.
+# The web app turns away schema-shaped action definitions and drops large ones upstream; an
+# action list in ordinary language is neither, so `tool_protocol: prose` asks for that instead.
+#
+# Nothing in these prompts names a serialization format or a schema key: the interface is called
+# an "action", its inputs are "arguments" written `name = value`, and lists and objects are
+# described in words rather than shown as punctuation. That is a property of the format, not a
+# trick - the reader never has to parse a nested literal to understand what to write.
+_PROSE_PROMPTS: dict[str, dict[str, str]] = {
+    "en": {
+        "interface": (
+            "I can run the actions listed below on this computer for you, and I will paste the "
+            "real output back to you in full. When something has to be done on this machine, "
+            "write the action directly instead of describing the steps or explaining that you "
+            "cannot reach it."
+        ),
+        "format": (
+            "How to write an action: put `action: <name>` alone on one line first, then one "
+            "`name = value` line per argument, then a blank line to end, then stop and wait for "
+            "me to paste the result. Write one action at a time. When a value spans several "
+            "lines, leave `name =` alone on its line and indent every following line with four "
+            "spaces. Write numbers, booleans, lists and objects as they are (square brackets "
+            "for lists, curly braces for objects)."
+        ),
+        "header": "These are the actions this computer can run.",
+        "action_line": "action {name}: {description}",
+        "argument_line": "    argument {text}",
+        "required": "required",
+        "optional": "optional",
+        "param_none": "none",
+        "param_line": "{name} ({flag}, {kind})",
+        "param_line_help": "{name} ({flag}, {kind}): {detail}",
+        "no_description": "no description",
+        "default_kind": "text",
+        "example": "For example:",
+        "lead": "action",
+        "choice_none": "This turn, write no action and answer in ordinary language only.",
+        "choice_required": "This turn, write one action block only, and nothing else.",
+        "choice_named": "This turn, write only `action: {target_name}`.",
+        "reminder": (
+            "\n\n(When something has to be done on this computer, first write `action: <name>`, "
+            "then one `name = value` line per argument, a blank line to end, then stop and wait "
+            "for the real output.)"
+        ),
+        "retry": (
+            "The format was wrong: no action was detected in the previous reply. Rewrite it in "
+            "that format only - one `action: <name>` line, then `name = value` lines, a blank "
+            "line to end, and no other text."
+        ),
+    },
+    "zh": {
+        "interface": (
+            "我可以替你在我这台电脑上执行下面这些动作，执行完我会把真实输出整段贴回给你。"
+            "需要动用电脑上的能力时，直接写出动作，不要只描述步骤，也不要解释你没有权限。"
+        ),
+        "format": (
+            "写动作的格式：先单独一行写「执行：动作名」，随后每行写一个「参数 = 值」，"
+            "参数写完空一行表示结束，然后停下等我贴回结果。一次只写一个动作。"
+            "参数值有多行时，写成单独一行「参数 =」，然后每行前面加四个空格。"
+            "值该是数字、真假、列表或对象时按原样写（列表用方括号，对象用花括号）。"
+        ),
+        "header": "下面是我这台电脑上能执行的动作。",
+        "action_line": "动作 {name}：{description}",
+        "argument_line": "    参数 {text}",
+        "required": "必填",
+        "optional": "可选",
+        "param_none": "无参数",
+        "param_line": "{name}（{flag}，{kind}）",
+        "param_line_help": "{name}（{flag}，{kind}）：{detail}",
+        "no_description": "无说明",
+        "default_kind": "文本",
+        "example": "例如：",
+        "lead": "执行",
+        "choice_none": "这一轮不要写任何动作，只用自然语言回答。",
+        "choice_required": "这一轮只写一个动作，不要写别的解释。",
+        "choice_named": "这一轮只写「执行：{target_name}」。",
+        "reminder": (
+            "\n\n（需要动用电脑上的能力时，先写「执行：动作名」，再每行写「参数 = 值」，"
+            "空一行结束，然后停下等我贴回真实输出。）"
+        ),
+        "retry": (
+            "格式不对：上一条没有检测到动作。请只按格式重写一遍——先一行「执行：动作名」，"
+            "再每行「参数 = 值」，空一行结束，不要别的文字。"
+        ),
+    },
+}
+PROSE_MAX_CALLS = 1
+PROSE_LEAD_RE = re.compile(
+    r"^[ \t]*(?:执行|调用|action|run)[ \t]*[:：][ \t]*([A-Za-z_][\w.-]*)[ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+PROSE_ARG_LINE_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?([\w.\-]+)[ \t]*[=:：][ \t]*(.*?)[ \t]*$")
+PROSE_CONTINUATION_INDENTS = ("    ", "\t")
+PROSE_FENCE_RE = re.compile(r"^[ \t]{0,3}(?:`{3,}|~{3,})")
 IMAGE_GENERATION_PROMPT = "\n\n".join(
     (
         "IMAGE PROTOCOL: Every image request MUST be answered with a generated image attachment.",
@@ -685,6 +779,262 @@ def extract_tool_calls(text: str) -> tuple[str, list[AppToolCall]]:
     return strip_system_hints(text), tool_calls
 
 
+def tool_protocol() -> Literal["pascal", "prose"]:
+    """Which tool interface the configured protocol asks for; 'pascal' when it cannot be read."""
+    configured = getattr(getattr(g_config, "gemini", None), "tool_protocol", "pascal")
+    return "prose" if configured == "prose" else "pascal"
+
+
+def tool_protocol_language() -> Literal["en", "zh"]:
+    """Which wording the prose protocol uses; 'en' unless Chinese is configured."""
+    configured = getattr(getattr(g_config, "gemini", None), "tool_protocol_language", "en")
+    return "zh" if configured == "zh" else "en"
+
+
+def tool_retry_attempts() -> int:
+    """How many times a forced tool choice may be re-asked under the prose protocol."""
+    configured = getattr(getattr(g_config, "gemini", None), "tool_retry_attempts", 1)
+    try:
+        return max(0, min(3, int(configured)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def tool_argument_max_chars() -> int:
+    """Largest serialized argument list one prose action may carry before it is dropped."""
+    configured = getattr(getattr(g_config, "gemini", None), "tool_argument_max_chars", 20000)
+    try:
+        return max(256, int(configured))
+    except (TypeError, ValueError):
+        return 20000
+
+
+def _prose(key: str, **fields: object) -> str:
+    """A prose-protocol string in the configured language, formatted with `fields`."""
+    template = _PROSE_PROMPTS[tool_protocol_language()][key]
+    return template.format(**fields) if fields else template
+
+
+def prose_call_prompt() -> str:
+    """The reminder appended to a continued chat, standing in for the PascalCase hint."""
+    return _prose("reminder")
+
+
+def prose_retry_nudge() -> str:
+    """What a forced tool choice re-asks with when no action was detected."""
+    return _prose("retry")
+
+
+def _short_text(text: str, limit: int) -> str:
+    cleaned = " ".join((text or "").split())
+    return cleaned if len(cleaned) <= limit else f"{cleaned[: limit - 1]}…"
+
+
+def _prose_param_lines(function: Any) -> list[str]:
+    schema = getattr(function, "parameters", None) or {}
+    properties = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    lines: list[str] = []
+    for name, spec in properties.items():
+        spec = spec if isinstance(spec, dict) else {}
+        kind = spec.get("type") or _prose("default_kind")
+        flag = _prose("required") if name in required else _prose("optional")
+        detail = _short_text(str(spec.get("description") or ""), 140)
+        template = "param_line_help" if detail else "param_line"
+        lines.append(_prose(template, name=name, flag=flag, kind=kind, detail=detail))
+    return lines or [_prose("param_none")]
+
+
+def _prose_example(tools: Sequence[Any]) -> str:
+    if not tools:
+        return ""
+    lead = _prose("lead")
+    function = getattr(tools[0], "function", tools[0])
+    schema = getattr(function, "parameters", None) or {}
+    properties = schema.get("properties") or {}
+    if not properties:
+        return f"{_prose('example')}\n{lead}: {function.name}"
+    name = next(iter(properties))
+    spec = properties[name] if isinstance(properties[name], dict) else {}
+    sample = spec.get("default")
+    if sample is None:
+        if name.endswith(("path", "dir", "file", "directory")):
+            sample = "."
+        else:
+            sample = "..." if tool_protocol_language() == "en" else "值"
+    if not isinstance(sample, str):
+        sample = orjson.dumps(sample).decode("utf-8")
+    return f"{_prose('example')}\n{lead}: {function.name}\n{name} = {sample}"
+
+
+def build_prose_tool_prompt(
+    tools: Sequence[Any],
+    tool_choice: (
+        Literal["none", "auto", "required"]
+        | ChatCompletionNamedToolChoice
+        | ToolChoiceFunction
+        | ToolChoiceTypes
+        | None
+    ),
+) -> str:
+    """Describe the tools as a plain action list, with the reply format they must follow."""
+    lines: list[str] = [_prose("interface"), _prose("format"), _prose("header")]
+    for tool in tools:
+        function = getattr(tool, "function", tool)
+        description = _short_text(function.description or _prose("no_description"), 240)
+        lines.append(_prose("action_line", name=function.name, description=description))
+        for param_line in _prose_param_lines(function):
+            lines.append(_prose("argument_line", text=param_line))
+
+    if example := _prose_example(tools):
+        lines.append(example)
+
+    if tool_choice == "none":
+        lines.append(_prose("choice_none"))
+    elif tool_choice == "required":
+        lines.append(_prose("choice_required"))
+    elif (target_name := extract_named_tool_choice(tool_choice)) is not None:
+        lines.append(_prose("choice_named", target_name=target_name))
+
+    return "\n".join(lines)
+
+
+def _prose_value(raw: str) -> Any:
+    """The value a `name = value` line holds, keeping the JSON types the model wrote."""
+    text = raw.strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    if lowered == "null":
+        return None
+    if re.fullmatch(r"-?\d+", text):
+        try:
+            return int(text)
+        except ValueError:
+            pass
+    elif re.fullmatch(r"-?\d+\.\d+", text):
+        try:
+            return float(text)
+        except ValueError:
+            pass
+    if text[0] in "[{" or (text[0] == '"' and text.endswith('"')):
+        try:
+            return orjson.loads(text)
+        except Exception:  # a malformed literal stays a plain string
+            return text
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "`'\"“”":
+        return text[1:-1]
+    return text
+
+
+def prose_call_spans(text: str) -> list[tuple[int, int, str, dict[str, Any]]]:
+    """Every `action: name` block outside a code fence, as (start, end, name, arguments).
+
+    Lines between ``` fences are skipped: a reply that quotes a file, a web page or an earlier
+    turn verbatim must not have that quoted text read back as an action.
+    """
+    spans: list[tuple[int, int, str, dict[str, Any]]] = []
+    lines = text.splitlines(keepends=True)
+    offset = 0
+    index = 0
+    in_fence = False
+    while index < len(lines):
+        body = lines[index].rstrip("\r\n")
+        if PROSE_FENCE_RE.match(body):
+            in_fence = not in_fence
+            offset += len(lines[index])
+            index += 1
+            continue
+        lead = None if in_fence else PROSE_LEAD_RE.match(body)
+        if not lead:
+            offset += len(lines[index])
+            index += 1
+            continue
+
+        start = offset
+        offset += len(lines[index])
+        index += 1
+        arguments: dict[str, Any] = {}
+        while index < len(lines):
+            raw = lines[index]
+            body = raw.rstrip("\r\n")
+            if not body.strip():
+                offset += len(raw)
+                index += 1
+                if arguments:
+                    break
+                continue
+            match = PROSE_ARG_LINE_RE.match(body)
+            if not match:
+                break
+            key, value = match.group(1), match.group(2)
+            offset += len(raw)
+            index += 1
+            if value.strip():
+                arguments[key] = _prose_value(value)
+                continue
+            # A bare `name =` opens an indented block, one line per value line.
+            block: list[str] = []
+            while index < len(lines):
+                continuation = lines[index].rstrip("\r\n")
+                if continuation.startswith(PROSE_CONTINUATION_INDENTS):
+                    block.append(
+                        continuation[4:] if continuation.startswith("    ") else continuation[1:]
+                    )
+                elif not continuation.strip() and block:
+                    block.append("")
+                else:
+                    break
+                offset += len(lines[index])
+                index += 1
+            arguments[key] = "\n".join(block).strip("\n")
+        spans.append((start, offset, lead.group(1), arguments))
+    return spans
+
+
+def extract_prose_tool_calls(
+    text: str, max_argument_chars: int | None = None
+) -> tuple[str, list[AppToolCall]]:
+    """The calls an action-list reply holds, and the reply with every such block removed.
+
+    At most `PROSE_MAX_CALLS` calls are returned: further blocks are still removed from the
+    visible text, so a reply cannot smuggle actions through the answer. A block whose arguments
+    exceed `max_argument_chars` is dropped instead of being handed to the caller.
+    """
+    spans = prose_call_spans(text)
+    if not spans:
+        return strip_system_hints(text), []
+
+    limit = tool_argument_max_chars() if max_argument_chars is None else max_argument_chars
+    visible_parts: list[str] = []
+    tool_calls: list[AppToolCall] = []
+    cursor = 0
+    for start, end, name, arguments in spans:
+        visible_parts.append(text[cursor:start])
+        cursor = end
+        payload = orjson.dumps(arguments).decode("utf-8")
+        if len(tool_calls) >= PROSE_MAX_CALLS:
+            logger.debug(f"Dropping an extra action block in one reply (kept {PROSE_MAX_CALLS}).")
+            continue
+        if len(payload) > limit:
+            logger.debug(f"Dropping action {name!r}: arguments exceed {limit} characters.")
+            continue
+        seed = f"{name}:{payload}:{len(tool_calls)}".encode()
+        tool_calls.append(
+            AppToolCall(
+                id=f"call_{hashlib.sha256(seed).hexdigest()[:24]}",
+                type="function",
+                function=AppToolCallFunction(name=name, arguments=payload),
+            )
+        )
+    visible_parts.append(text[cursor:])
+
+    visible = re.sub(r"\n{3,}", "\n\n", "".join(visible_parts)).strip()
+    return strip_system_hints(visible), tool_calls
+
+
 def text_from_message(message: AppMessage) -> str:
     """The text of a message followed by the arguments of its tool calls."""
     base_text = ""
@@ -914,16 +1264,25 @@ def process_llm_output(
     thoughts: str | None,
     raw_text: str,
     structured_requirement: StructuredOutputRequirement | None,
+    allowed_tool_names: Collection[str] | None = None,
 ) -> tuple[str | None, str, list[AppToolCall]]:
     """A finished reply as (thoughts, text, tool calls).
 
     The text has the protocol blocks removed and, under a response format, is the canonical JSON
-    the reply held. Raises `StructuredOutputValidationError` when a strict format is not met.
+    the reply held. When `allowed_tool_names` is given, a call to any action that was not offered
+    this turn is dropped: the reply can quote untrusted text, so only the offered actions may be
+    returned. Raises `StructuredOutputValidationError` when a strict format is not met.
     """
     if thoughts:
         thoughts = thoughts.strip()
 
-    visible_output, tool_calls = extract_tool_calls(raw_text)
+    if tool_protocol() == "prose":
+        visible_output, tool_calls = extract_prose_tool_calls(raw_text)
+        if not tool_calls:
+            # An action-list reply that slipped back into the tag protocol still counts.
+            visible_output, tool_calls = extract_tool_calls(raw_text)
+    else:
+        visible_output, tool_calls = extract_tool_calls(raw_text)
     if tool_calls:
         logger.debug(f"Detected {len(tool_calls)} tool call(s) in model output.")
 
@@ -948,6 +1307,17 @@ def process_llm_output(
                 f"{structured_requirement.schema_name!r}."
             )
 
+    if tool_calls and allowed_tool_names is not None:
+        allowed = {str(name) for name in allowed_tool_names}
+        kept = [call for call in tool_calls if call.function.name in allowed]
+        if len(kept) != len(tool_calls):
+            dropped = sorted({call.function.name for call in tool_calls} - allowed)
+            logger.debug(
+                f"Dropped {len(tool_calls) - len(kept)} call(s) to actions not offered "
+                f"this turn: {dropped}"
+            )
+        tool_calls = kept
+
     return thoughts, visible_output, tool_calls
 
 
@@ -970,9 +1340,12 @@ def build_tool_prompt(
         | None
     ),
 ) -> str:
-    """Generate a system prompt describing available tools and the PascalCase protocol."""
+    """Generate a system prompt describing available tools and the protocol in use."""
     if not tools:
         return ""
+
+    if tool_protocol() == "prose":
+        return build_prose_tool_prompt(tools, tool_choice)
 
     lines: list[str] = [TOOL_INTERFACE_PROMPT]
 
@@ -1009,14 +1382,20 @@ def build_image_generation_instruction(
 
 
 def append_tool_hint_to_last_user_message(messages: list[AppMessage]) -> None:
-    """Ensure the last user message carries the tool wrap hint."""
+    """Ensure the last user message carries the tool hint of the protocol in use."""
+    if tool_protocol() == "prose":
+        hint = prose_call_prompt()
+        marker = hint.strip()
+    else:
+        hint, marker = TOOL_WRAP_HINT, TOOL_HINT_STRIPPED
+
     for msg in reversed(messages):
         if msg.role != "user" or msg.content is None:
             continue
 
         if isinstance(msg.content, str):
-            if TOOL_HINT_STRIPPED not in msg.content:
-                msg.content = f"{msg.content}\n{TOOL_WRAP_HINT}"
+            if marker not in msg.content:
+                msg.content = f"{msg.content}\n{hint}"
             return
 
         if isinstance(msg.content, list):
@@ -1024,11 +1403,11 @@ def append_tool_hint_to_last_user_message(messages: list[AppMessage]) -> None:
                 if getattr(part, "type", None) != "text":
                     continue
                 text_value = getattr(part, "text", "") or ""
-                if TOOL_HINT_STRIPPED in text_value:
+                if marker in text_value:
                     return
-                part.text = f"{text_value}\n{TOOL_WRAP_HINT}"
+                part.text = f"{text_value}\n{hint}"
                 return
 
-            messages_text = TOOL_WRAP_HINT.strip()
+            messages_text = hint.strip()
             msg.content.append(AppContentItem(type="text", text=messages_text))
             return

@@ -452,6 +452,7 @@ class _SentRequest(NamedTuple):
     prepared: list[AppMessage]  # with tool and schema instructions added; this is what is stored
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceFunction | None
     structured_requirement: StructuredOutputRequirement | None
+    tool_names: set[str] | None = None  # the names offered; a reply may only call these
 
 
 async def _send_gemini_request(
@@ -500,6 +501,7 @@ async def _send_gemini_request(
         prepared,
         tool_choice,
         structured_requirement,
+        {tool.name for tool in tools or []} or None,
     )
 
 
@@ -547,6 +549,7 @@ async def gemini_generate_content(
             normalize_llm_text(resp.thoughts or ""),
             normalize_llm_text(resp.text or ""),
             sent.structured_requirement,
+            sent.tool_names,
         )
     except StructuredOutputValidationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -630,6 +633,7 @@ async def _stream_reply(sent: _SentRequest, base_url: str) -> AsyncGenerator[str
                 normalize_llm_text(streamed.thoughts),
                 normalize_llm_text(streamed.text),
                 sent.structured_requirement,
+                sent.tool_names,
             )
         except StructuredOutputValidationError as exc:
             logger.warning(f"[Gemini API] Structured output rejected mid-stream: {exc}")

@@ -40,9 +40,27 @@ webapi_client.ARTIFACTS_RE = re.compile(r"https?://googleusercontent\.com/(?:\w+
 type ModelSpec = str | AvailableModel | None
 
 
+def cookie_pairs(jar: Any) -> dict[str, str]:
+    """The name/value pairs of a cookie file, in either shape a browser exports.
+
+    A Playwright or browser-extension dump is a list of objects carrying `name` and `value`; a
+    plain jar is one object of name to value. Anything else yields nothing.
+    """
+    if isinstance(jar, dict):
+        return {str(name): str(value) for name, value in jar.items()}
+    if isinstance(jar, list):
+        return {
+            str(item["name"]): str(item["value"])
+            for item in jar
+            if isinstance(item, dict) and item.get("name") and item.get("value") is not None
+        }
+    return {}
+
+
 class GeminiClientWrapper(GeminiClient):
     def __init__(self, client_id: str, **kwargs):
         self._cfg_impersonate: str | None = kwargs.pop("impersonate", None)
+        self._cfg_cookies_file: str | None = kwargs.pop("cookies_file", None)
         super().__init__(**kwargs)
         self.id = client_id
         self._initialized = False
@@ -71,6 +89,7 @@ class GeminiClientWrapper(GeminiClient):
         }
         if self._cfg_impersonate is not None:
             init_kwargs["impersonate"] = self._cfg_impersonate
+        self._load_extra_cookies()
         try:
             await super().init(**init_kwargs)
             self._initialized = True
@@ -78,6 +97,35 @@ class GeminiClientWrapper(GeminiClient):
             self._initialized = False
             logger.exception(f"Failed to initialize GeminiClient {self.id}")
             raise
+
+    def _load_extra_cookies(self) -> None:
+        """Merge the cookie jar dumped from a real browser into the session.
+
+        A session that presents only __Secure-1PSID/__Secure-1PSIDTS is bounced to
+        accounts.google.com (`ServiceLogin?...&osid=1`); adding the rest of the jar, OSID
+        included, keeps it authenticated and gives the library what it needs to rotate
+        __Secure-1PSIDTS. Values land in the in-memory jar only, never in the config file.
+        """
+        if not self._cfg_cookies_file:
+            return
+        path = Path(self._cfg_cookies_file)
+        if not path.is_file():
+            logger.warning(
+                f"cookies_file for client {self.id} not found at {path}; "
+                "continuing with __Secure-1PSID/__Secure-1PSIDTS only"
+            )
+            return
+        try:
+            jar = orjson.loads(path.read_bytes())
+        except Exception as e:
+            logger.warning(f"Could not parse cookies_file {path}: {e}")
+            return
+        cookies = cookie_pairs(jar)
+        if not cookies:
+            logger.warning(f"cookies_file {path} holds no name/value cookie pairs")
+            return
+        self.cookies = cookies
+        logger.info(f"Loaded {len(cookies)} extra cookies for client {self.id} from {path}")
 
     def running(self) -> bool:
         return self._running

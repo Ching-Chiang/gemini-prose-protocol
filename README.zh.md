@@ -1,4 +1,4 @@
-# Gemini-FastAPI
+# Gemini 散文协议 / Gemini Prose Protocol
 
 [![Python 3.13](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-green.svg)](https://fastapi.tiangolo.com/)
@@ -10,6 +10,8 @@
 
 **无需 API Key，免费通过 API 调用 Gemini 网页端模型！**
 
+本仓库 fork 自 [Nativu5/Gemini-FastAPI](https://github.com/Nativu5/Gemini-FastAPI)（MIT，© 2025 Yongkun Li），在此之上加入了下面这套散文工具协议。仓库的第一个提交就是上游原样的代码树，所以两者的差异恰好等于 `git log -p`。
+
 ## 功能特性
 
 - **无需 Google API Key**：使用已登录的 Gemini 网页会话的 Cookie 进行认证。
@@ -19,6 +21,27 @@
 - **内置 Google 搜索**：回答可以使用 Gemini 网页端自带的搜索能力。
 - **会话复用**：后续请求会接着同一个 Google 会话继续，而不是重新发送全部历史。
 - **多账号**：请求在多个账号之间分发，每个账号可单独配置代理。
+
+## 散文工具协议
+
+网页端不接受长得像 schema 的工具定义，体积大的还会被直接丢掉。把 `tool_protocol` 设成 `"prose"` 之后，工具改成用一段普通文字的动作清单描述给模型，回复里的动作块再被解析出来，作为普通的 OpenAI `tool_calls` 返回：
+
+```
+执行：read_file
+path = app/models.py
+```
+
+这是拿概率换可行性：动作清单被接受的次数远多于 schema，代价是偶尔会漏。`tool_choice: "auto"` 从不重试；强制或指定的 `tool_choice` 会按 `tool_retry_attempts` 重问一次。
+
+```yaml
+gemini:
+  tool_protocol: "prose"          # "pascal" 是原来的 [ToolCalls] 标签协议
+  tool_protocol_language: "zh"    # 指令措辞："zh" 或 "en"
+  tool_retry_attempts: 1          # 强制 tool_choice 没拿到动作时重问的次数
+  tool_argument_max_chars: 20000  # 单个动作参数块的长度上限
+```
+
+回复属于不可信文本，所以只接受本轮真正提供过的动作，一次回复最多取一个动作，代码块里的动作块会被忽略，超过长度上限的参数块会被丢弃。`scripts/measure_prose_hit_rate.py` 可以在你自己的账号上实测命中率。
 
 ## 快速开始
 
