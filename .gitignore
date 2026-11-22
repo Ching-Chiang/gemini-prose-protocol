@@ -1,0 +1,15 @@
+.python-version
+.DS_Store
+.vscode
+.cursor
+.idea
+
+.venv
+*.egg-info
+.ruff_cache
+__pycache__
+
+.env
+config.debug.yaml
+data/
+tmp/
